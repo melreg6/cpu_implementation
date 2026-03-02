@@ -1,0 +1,5 @@
+# Scientific Computing
+MDAnalysis==2.10.0
+
+# Visualization
+matplotlib==3.8.0
