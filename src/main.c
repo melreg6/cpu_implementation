@@ -15,42 +15,43 @@
 #include "cell_mt.h"
 #include "neighbor_list_pthread.h"
 #include "cell_manhattan_pthread.h"
+#include "gpu_manhattan.h"
 
 #define MAX_ATOMS 50000
 
 // ----------------------------------------------------
 // Time measurement by clock_gettime()
 // ----------------------------------------------------
-double interval(struct timespec start, struct timespec end)
+static double interval(struct timespec a, struct timespec b)
 {
-    struct timespec temp;
-    temp.tv_sec = end.tv_sec - start.tv_sec;
-    temp.tv_nsec = end.tv_nsec - start.tv_nsec;
-    if (temp.tv_nsec < 0) {
-        temp.tv_sec = temp.tv_sec - 1;
-        temp.tv_nsec = temp.tv_nsec + 1000000000;
-    }
-    return (((double)temp.tv_sec) + ((double)temp.tv_nsec) * 1.0e-9);
+    return (b.tv_sec - a.tv_sec) + 1e-9*(b.tv_nsec - a.tv_nsec);
 }
 
 // ----------------------------------------------------
-// Helper: copy particle array
+// Helpers
 // ----------------------------------------------------
-static void copy_particles(Particle *dst, const Particle *src, size_t N)
+static double wrap_pos(double x, double L)
+{
+    x = fmod(x, L);
+    if (x < 0) x += L;
+    return x;
+}
+
+// Initialize velocities to random in [-0.5, 0.5]
+static void init_velocities(Particle *p, size_t N)
 {
     for (size_t i = 0; i < N; i++) {
-        dst[i] = src[i];
+        p[i].vx = ((double)rand() / RAND_MAX) - 0.5;
+        p[i].vy = ((double)rand() / RAND_MAX) - 0.5;
+        p[i].vz = ((double)rand() / RAND_MAX) - 0.5;
     }
 }
 
-// ----------------------------------------------------
-// Helper: open energy CSV file
-// ----------------------------------------------------
-static FILE *open_energy_csv(const char *path)
+static FILE* open_energy_csv(const char *path)
 {
     FILE *f = fopen(path, "w");
     if (!f) {
-        perror("fopen energy csv");
+        perror("fopen");
         return NULL;
     }
     fprintf(f, "step,K,U,E\n");
@@ -58,30 +59,203 @@ static FILE *open_energy_csv(const char *path)
 }
 
 // ----------------------------------------------------
-// Helper: wrap position into [0, L)
+// Integrators (Velocity Verlet style)
 // ----------------------------------------------------
-static inline double wrap_pos(double x, double L)
-{
-    x = fmod(x, L);
-    if (x < 0) x += L;
-    return x;
-}
+static double md_integrate_full(
+    Particle *p,
+    const SimParams *sp,
+    double *K_out
+){
+    const size_t N = sp->N;
+    const double dt = sp->dt;
+    const double L  = sp->L;
 
-// ----------------------------------------------------
-// Helper: kinetic energy (assumes unit mass)
-// ----------------------------------------------------
-static double kinetic_energy(const Particle *p, size_t N)
-{
-    double K = 0.0;
+    // half-step velocity + position
     for (size_t i = 0; i < N; i++) {
-        K += 0.5 * (p[i].vx * p[i].vx + p[i].vy * p[i].vy + p[i].vz * p[i].vz);
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+
+        p[i].x  += dt * p[i].vx;
+        p[i].y  += dt * p[i].vy;
+        p[i].z  += dt * p[i].vz;
+
+        p[i].x = wrap_pos(p[i].x, L);
+        p[i].y = wrap_pos(p[i].y, L);
+        p[i].z = wrap_pos(p[i].z, L);
     }
-    return K;
+
+    // forces
+    double U = md_compute_forces_full(p, sp);
+
+    // half-step velocity
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+    }
+
+    if (K_out) *K_out = kinetic_energy(p, N);
+    return U;
 }
 
-// ----------------------------------------------------
-// Manhattan Velocity-Verlet integrator (Pthread force)
-// ----------------------------------------------------
+static double md_integrate_cell(
+    Particle *p,
+    const SimParams *sp,
+    CellList *cl,
+    double *K_out
+){
+    const size_t N = sp->N;
+    const double dt = sp->dt;
+    const double L  = sp->L;
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+
+        p[i].x  += dt * p[i].vx;
+        p[i].y  += dt * p[i].vy;
+        p[i].z  += dt * p[i].vz;
+
+        p[i].x = wrap_pos(p[i].x, L);
+        p[i].y = wrap_pos(p[i].y, L);
+        p[i].z = wrap_pos(p[i].z, L);
+    }
+
+    cell_list_build(cl, p, L);
+
+    double U = md_compute_forces_cell(p, sp, cl);
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+    }
+
+    if (K_out) *K_out = kinetic_energy(p, N);
+    return U;
+}
+
+static double md_integrate_nbl(
+    Particle *p,
+    const SimParams *sp,
+    NeighborList *nl,
+    CellList *cl,
+    double *K_out
+){
+    const size_t N = sp->N;
+    const double dt = sp->dt;
+    const double L  = sp->L;
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+
+        p[i].x  += dt * p[i].vx;
+        p[i].y  += dt * p[i].vy;
+        p[i].z  += dt * p[i].vz;
+
+        p[i].x = wrap_pos(p[i].x, L);
+        p[i].y = wrap_pos(p[i].y, L);
+        p[i].z = wrap_pos(p[i].z, L);
+    }
+
+    // rebuild bins + neighbor list
+    cell_list_build(cl, p, L);
+    nbl_build(nl, cl, p, sp->L, sp->rc, sp->N);
+
+    double U = md_compute_forces_nbl(p, sp, nl);
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+    }
+
+    if (K_out) *K_out = kinetic_energy(p, N);
+    return U;
+}
+
+static double md_integrate_cell_mt(
+    Particle *p,
+    const SimParams *sp,
+    CellList *cl,
+    double *K_out
+){
+    const size_t N = sp->N;
+    const double dt = sp->dt;
+    const double L  = sp->L;
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+
+        p[i].x  += dt * p[i].vx;
+        p[i].y  += dt * p[i].vy;
+        p[i].z  += dt * p[i].vz;
+
+        p[i].x = wrap_pos(p[i].x, L);
+        p[i].y = wrap_pos(p[i].y, L);
+        p[i].z = wrap_pos(p[i].z, L);
+    }
+
+    cell_list_build(cl, p, L);
+
+    double U = md_compute_forces_cell_mt(p, sp, cl);
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+    }
+
+    if (K_out) *K_out = kinetic_energy(p, N);
+    return U;
+}
+
+static double md_integrate_nbl_pthread(
+    Particle *p,
+    const SimParams *sp,
+    NeighborList *nl,
+    CellList *cl,
+    double *K_out
+){
+    const size_t N = sp->N;
+    const double dt = sp->dt;
+    const double L  = sp->L;
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+
+        p[i].x  += dt * p[i].vx;
+        p[i].y  += dt * p[i].vy;
+        p[i].z  += dt * p[i].vz;
+
+        p[i].x = wrap_pos(p[i].x, L);
+        p[i].y = wrap_pos(p[i].y, L);
+        p[i].z = wrap_pos(p[i].z, L);
+    }
+
+    cell_list_build(cl, p, L);
+    nbl_build_pthread(nl, cl, p, sp->L, sp->rc, sp->N);
+
+    double U = md_compute_forces_nbl_pthread(p, sp, nl);
+
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+    }
+
+    if (K_out) *K_out = kinetic_energy(p, N);
+    return U;
+}
+
 static double md_integrate_manhattan_pthread(
     Particle *p,
     const SimParams *sp,
@@ -126,146 +300,176 @@ static double md_integrate_manhattan_pthread(
     return U;
 }
 
-// ----------------------------------------------------
-// main
-// ----------------------------------------------------
+static double md_integrate_manhattan_gpu(
+    Particle *p,
+    const SimParams *sp,
+    double *K_out
+){
+    const size_t N = sp->N;
+    const double dt = sp->dt;
+    const double L  = sp->L;
+
+    // 1) half-step velocity update + position update
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+
+        p[i].x  += dt * p[i].vx;
+        p[i].y  += dt * p[i].vy;
+        p[i].z  += dt * p[i].vz;
+
+        p[i].x = wrap_pos(p[i].x, L);
+        p[i].y = wrap_pos(p[i].y, L);
+        p[i].z = wrap_pos(p[i].z, L);
+    }
+
+    // 2) compute new forces + potential on GPU (GPU builds Manhattan cell bins internally)
+    double U = md_compute_forces_cell_manhattan_gpu(p, sp);
+
+    // 3) half-step velocity update using new forces
+    for (size_t i = 0; i < N; i++) {
+        p[i].vx += 0.5 * dt * p[i].fx;
+        p[i].vy += 0.5 * dt * p[i].fy;
+        p[i].vz += 0.5 * dt * p[i].fz;
+    }
+
+    // 4) kinetic energy
+    if (K_out) *K_out = kinetic_energy(p, N);
+    return U;
+}
+
+// ---------------------------------------
+// MAIN
+// ---------------------------------------
 int main(int argc, char **argv)
 {
+    srand(0);
+
+    // ------------------------------------------------
+    // Parse args
+    // ------------------------------------------------
     if (argc < 2) {
-        printf("Usage: %s input_path [--threads N | -t N]\n", argv[0]);
+        printf("Usage: %s input.pdb [--threads N]\n", argv[0]);
         return 1;
     }
 
     const char *input_path = argv[1];
+    int user_threads = 4;
 
-    printf("\n================ INITIALIZING SIMULATION ================\n");
-
-    // ---- parse optional --threads / -t ----
-    int user_threads = N_THREADS;
     for (int i = 2; i < argc; i++) {
-        if ((!strcmp(argv[i], "--threads") || !strcmp(argv[i], "-t")) && (i + 1 < argc)) {
-            user_threads = atoi(argv[++i]);
-            if (user_threads < 1) user_threads = 1;
+        if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            user_threads = atoi(argv[i + 1]);
+            i++;
         }
     }
 
-    double xmin, xmax, ymin, ymax, zmin, zmax;
-
-    printf("Converting input file via Python script...\n");
-    char command[256];
-    sprintf(command, "./venv/bin/python3 src/py/converter.py %s temp_coords.bin temp_metadata.txt", input_path);
-    int status = system(command);
-
-    if (status != 0) {
-        fprintf(stderr, "Error: Python conversion failed.\n");
+    // ------------------------------------------------
+    // Read PDB
+    // ------------------------------------------------
+    Particle p0[MAX_ATOMS];
+    int N = 0;
+    if (pdb_import_particles(input_path, p0, &N) != 0) {
+        fprintf(stderr, "Failed to read input PDB: %s\n", input_path);
         return 1;
     }
-
-    FILE *f_meta = fopen("temp_metadata.txt", "r");
-    int N;
-    if (f_meta) {
-        fscanf(f_meta, "%d", &N);
-        fclose(f_meta);
-    } else {
-        fprintf(stderr, "Metadata not found!\n");
-        return 1;
-    }
-
-    Particle *p0 = malloc((size_t)N * sizeof(Particle));
-    if (!p0) {
-        fprintf(stderr, "Allocation failure p0\n");
-        return 1;
-    }
-
-    int foo;
-    foo = binary_importer("temp_coords.bin", p0, N,
-                         &xmin, &xmax,
-                         &ymin, &ymax,
-                         &zmin, &zmax);
-    (void)foo;
-
-    if (N <= 0) {
-        fprintf(stderr, "Failed to read PDB: %s\n", input_path);
-        free(p0);
-        return 1;
-    }
-
-    printf("deleting temp files \n");
-    (void)system("rm -rf temp_coords.bin");
-    (void)system("rm -rf temp_metadata.txt");
-
-    printf("Loaded %d atoms from %s\n", N, input_path);
-    printf("Bounds: dx = %.3f  dy = %.3f  dz = %.3f\n",
-           xmax - xmin, ymax - ymin, zmax - zmin);
+    printf("Read %d particles from %s\n", N, input_path);
 
     // ------------------------------------------------
-    // 2. Set up simulation parameters
+    // Params
     // ------------------------------------------------
     SimParams sp;
-    sp.N        = (size_t)N;
-    sp.sigma    = CONF_SIGMA;
-    sp.epsilon  = CONF_EPSILON;
-    sp.rc       = CONF_CUTOFF;
-    sp.rc2      = sp.rc * sp.rc;
-    sp.dt       = CONF_DELTA_T;
-
-    // Use CLI override
+    sp.N = (size_t)N;
+    sp.L = 50.0;           // box length (tune as needed)
+    sp.rc = 2.5;
+    sp.rc2 = sp.rc * sp.rc;
+    sp.sigma = 1.0;
+    sp.epsilon = 1.0;
+    sp.dt = 0.005;
     sp.nthreads = user_threads;
 
-    // Use largest span as box length
-    sp.L = fmax(fmax(xmax - xmin, ymax - ymin), zmax - zmin);
-    if (sp.L <= 0.0) sp.L = CONF_BOX_MAX;
-
-    printf("Simulation box L = %.3f\n", sp.L);
-    printf("rc = %.3f, dt = %.5f, steps = %d\n",
-           sp.rc, sp.dt, AUTOTUNE_N_TIMESTEPS);
-    printf("Manual thread override: %d\n", sp.nthreads);
+    printf("Box L=%.2f, rc=%.2f, dt=%.4f\n", sp.L, sp.rc, sp.dt);
 
     // ------------------------------------------------
-    // 3. Make copies for each MD method and for the final simulation
+    // Make copies for each algorithm
     // ------------------------------------------------
-    Particle *p_full = malloc((size_t)N * sizeof(Particle));
-    Particle *p_cell = malloc((size_t)N * sizeof(Particle));
-    Particle *p_nbl  = malloc((size_t)N * sizeof(Particle));
-    Particle *p_cell_mt = malloc((size_t)N * sizeof(Particle));
-    Particle *p_nbl_pthread = malloc((size_t)N * sizeof(Particle));
-    Particle *p_manhattan = malloc((size_t)N * sizeof(Particle));
-    Particle *p_final = malloc((size_t)N * sizeof(Particle));
+    Particle *p0_dyn = (Particle*)malloc((size_t)N * sizeof(Particle));
+    Particle *p_full = (Particle*)malloc((size_t)N * sizeof(Particle));
+    Particle *p_cell = (Particle*)malloc((size_t)N * sizeof(Particle));
+    Particle *p_nbl  = (Particle*)malloc((size_t)N * sizeof(Particle));
+    Particle *p_cell_mt = (Particle*)malloc((size_t)N * sizeof(Particle));
+    Particle *p_nbl_pthread = (Particle*)malloc((size_t)N * sizeof(Particle));
+    Particle *p_manhattan = (Particle*)malloc((size_t)N * sizeof(Particle));
+    Particle *p_final = (Particle*)malloc((size_t)N * sizeof(Particle));
 
-    if (!p_full || !p_cell || !p_nbl || !p_cell_mt || !p_nbl_pthread || !p_manhattan || !p_final) {
-        fprintf(stderr, "Allocation failure for particle copies\n");
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+    if (!p0_dyn || !p_full || !p_cell || !p_nbl || !p_cell_mt || !p_nbl_pthread || !p_manhattan || !p_final) {
+        fprintf(stderr, "malloc failed\n");
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
 
-    copy_particles(p_full, p0, (size_t)N);
-    copy_particles(p_cell, p0, (size_t)N);
-    copy_particles(p_nbl,  p0, (size_t)N);
-    copy_particles(p_cell_mt, p0, (size_t)N);
-    copy_particles(p_nbl_pthread, p0, (size_t)N);
-    copy_particles(p_manhattan, p0, (size_t)N);
-    copy_particles(p_final, p0, (size_t)N);
+    for (int i = 0; i < N; i++) {
+        p0_dyn[i] = p0[i];
+    }
 
-    printf("\n================ BEGINNING AUTOTUNING ================\n");
+    // initialize velocities + forces
+    init_velocities(p0_dyn, (size_t)N);
+    zero_forces(p0_dyn, (size_t)N);
+
+    // copies
+    memcpy(p_full, p0_dyn, (size_t)N * sizeof(Particle));
+    memcpy(p_cell, p0_dyn, (size_t)N * sizeof(Particle));
+    memcpy(p_nbl,  p0_dyn, (size_t)N * sizeof(Particle));
+    memcpy(p_cell_mt, p0_dyn, (size_t)N * sizeof(Particle));
+    memcpy(p_nbl_pthread, p0_dyn, (size_t)N * sizeof(Particle));
+    memcpy(p_manhattan, p0_dyn, (size_t)N * sizeof(Particle));
+    memcpy(p_final, p0_dyn, (size_t)N * sizeof(Particle));
+
+    // ------------------------------------------------
+    // Setup output dir
+    // ------------------------------------------------
+    system("mkdir -p output");
+
+    // ------------------------------------------------
+    // Init common data structures
+    // ------------------------------------------------
+    CellList cl;
+    cell_list_init(&cl, (size_t)N, sp.L, sp.rc);
+    cell_list_build(&cl, p_cell, sp.L);
+
+    CellList cl2;
+    cell_list_init(&cl2, (size_t)N, sp.L, sp.rc);
+    cell_list_build(&cl2, p_nbl, sp.L);
+
+    NeighborList nl;
+    nbl_init(&nl, (size_t)N, sp.rc, 0.3 * sp.rc);
+    nbl_build(&nl, &cl2, p_nbl, sp.L, sp.rc, (size_t)N);
+
+    // pthread neighbor list system init
+    nbl_pthread_init(sp.nthreads);
+
+    // ------------------------------------------------
+    // AUTOTUNE SETTINGS
+    // ------------------------------------------------
+   const int AUTOTUNE_N_TIMESTEPS = 50;
 
     struct timespec time_start, time_stop;
 
     // ------------------------------------------------
-    // 4. FULL O(N^2) MD - WITH TIMING
+    // 1) FULL O(N^2)
     // ------------------------------------------------
-    printf("\n================ FULL O(N^2) MD ================\n");
-
+    printf("\n================ FULL O(N^2) ================\n");
     FILE *f_full = open_energy_csv("output/full_energies.csv");
     if (!f_full) {
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
 
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_start);
 
-    (void) md_compute_forces_full(p_full, &sp);
+    md_compute_forces_full(p_full, &sp);
 
     for (int step = 0; step < AUTOTUNE_N_TIMESTEPS; step++) {
         double K, U;
@@ -278,26 +482,22 @@ int main(int argc, char **argv)
 
     fclose(f_full);
     io_write_pdb("output/full_positions.pdb", p_full, (size_t)N);
-    printf("FULL MD done. Time: %.6f seconds\n", time_full);
+    printf("FULL done. Time: %.6f seconds\n", time_full);
 
     // ------------------------------------------------
-    // 5. CELL-LIST MD - WITH TIMING
+    // 2) CELL-LIST
     // ------------------------------------------------
-    printf("\n================ CELL-LIST MD ================\n");
-
+    printf("\n================ CELL-LIST ================\n");
     FILE *f_cell = open_energy_csv("output/cell_energies.csv");
     if (!f_cell) {
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
 
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_start);
 
-    CellList cl;
-    cell_list_init(&cl, (size_t)N, sp.L, sp.rc);
-    cell_list_build(&cl, p_cell, sp.L);
-    (void) md_compute_forces_cell(p_cell, &sp, &cl);
+    md_compute_forces_cell(p_cell, &sp, &cl);
 
     for (int step = 0; step < AUTOTUNE_N_TIMESTEPS; step++) {
         double K, U;
@@ -310,31 +510,22 @@ int main(int argc, char **argv)
 
     fclose(f_cell);
     io_write_pdb("output/cell_positions.pdb", p_cell, (size_t)N);
-    printf("CELL-LIST MD done. Time: %.6f seconds\n", time_cell);
+    printf("CELL-LIST done. Time: %.6f seconds\n", time_cell);
 
     // ------------------------------------------------
-    // 6. NEIGHBOR-LIST MD (Serial) - WITH TIMING
+    // 3) NEIGHBOR-LIST (Serial)
     // ------------------------------------------------
-    printf("\n================ NEIGHBOR-LIST MD (Serial) ================\n");
-
+    printf("\n================ NEIGHBOR-LIST (Serial) ================\n");
     FILE *f_nbl = open_energy_csv("output/nbl_energies.csv");
     if (!f_nbl) {
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
 
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_start);
 
-    CellList cl2;
-    cell_list_init(&cl2, (size_t)N, sp.L, sp.rc);
-    cell_list_build(&cl2, p_nbl, sp.L);
-
-    NeighborList nl;
-    nbl_init(&nl, (size_t)N, sp.rc, 0.3 * sp.rc);
-    nbl_build(&nl, &cl2, p_nbl, sp.L, sp.rc, (size_t)N);
-
-    (void) md_compute_forces_nbl(p_nbl, &sp, &nl);
+    md_compute_forces_nbl(p_nbl, &sp, &nl);
 
     for (int step = 0; step < AUTOTUNE_N_TIMESTEPS; step++) {
         double K, U;
@@ -347,31 +538,30 @@ int main(int argc, char **argv)
 
     fclose(f_nbl);
     io_write_pdb("output/nbl_positions.pdb", p_nbl, (size_t)N);
-    printf("NEIGHBOR-LIST MD (Serial) done. Time: %.6f seconds\n", time_nbl);
+    printf("NEIGHBOR-LIST (Serial) done. Time: %.6f seconds\n", time_nbl);
 
     // ------------------------------------------------
-    // HALF-SHELL MULTI-THREADED CELL-LIST MD
+    // 4) CELL-LIST HALF-SHELL MT
     // ------------------------------------------------
-    printf("\n================ HALF-SHELL PARALLEL CELL-LIST MD ================\n");
-
-    FILE *f_cell_mt = open_energy_csv("output/cell_half_mt_energies.csv");
-    if (!f_cell_mt){
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+    printf("\n================ CELL-LIST HALF-SHELL MT ================\n");
+    FILE *f_cell_mt = open_energy_csv("output/cell_mt_energies.csv");
+    if (!f_cell_mt) {
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
 
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_start);
 
-    CellList cl_half;
-    cell_list_init(&cl_half, (size_t)N, sp.L, sp.rc);
-    cell_list_build(&cl_half, p_cell_mt, sp.L);
+    CellList cl_mt;
+    cell_list_init(&cl_mt, (size_t)N, sp.L, sp.rc);
+    cell_list_build(&cl_mt, p_cell_mt, sp.L);
 
-    md_compute_forces_cell_mt(p_cell_mt, &sp, &cl_half);
+    md_compute_forces_cell_mt(p_cell_mt, &sp, &cl_mt);
 
     for (int step = 0; step < AUTOTUNE_N_TIMESTEPS; step++) {
         double K, U;
-        U = md_integrate_cell_mt(p_cell_mt, &sp, &cl_half, &K);
+        U = md_integrate_cell_mt(p_cell_mt, &sp, &cl_mt, &K);
         fprintf(f_cell_mt, "%d,%.10f,%.10f,%.10f\n", step, K, U, K+U);
     }
 
@@ -379,39 +569,37 @@ int main(int argc, char **argv)
     double time_cell_mt = interval(time_start, time_stop);
 
     fclose(f_cell_mt);
-    io_write_pdb("output/cell_half_mt_positions.pdb", p_cell_mt, (size_t)N);
-    printf("HALF-SHELL MULTI-THREADED CELL-LIST MD done. Time: %.6f seconds\n", time_cell_mt);
+    io_write_pdb("output/cell_mt_positions.pdb", p_cell_mt, (size_t)N);
+    printf("CELL-LIST HALF-SHELL MT done. Time: %.6f seconds\n", time_cell_mt);
 
     // ------------------------------------------------
-    // 7. NEIGHBOR-LIST MD (Pthread) - WITH TIMING
+    // 5) NEIGHBOR-LIST (Pthread)
     // ------------------------------------------------
-    printf("\n================ NEIGHBOR-LIST MD (Pthread) ================\n");
-    nbl_pthread_print_info();
+    printf("\n================ NEIGHBOR-LIST (Pthread) ================\n");
+    printf("NBL pthread threads: %d\n", nbl_pthread_get_num_threads());
 
     FILE *f_nbl_pthread = open_energy_csv("output/nbl_pthread_energies.csv");
     if (!f_nbl_pthread) {
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
 
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_start);
 
-    nbl_pthread_init((size_t)N);
+    CellList cl_nbl_pt;
+    cell_list_init(&cl_nbl_pt, (size_t)N, sp.L, sp.rc);
+    cell_list_build(&cl_nbl_pt, p_nbl_pthread, sp.L);
 
-    CellList cl3;
-    cell_list_init(&cl3, (size_t)N, sp.L, sp.rc);
-    cell_list_build(&cl3, p_nbl_pthread, sp.L);
+    NeighborList nl_pt;
+    nbl_init(&nl_pt, (size_t)N, sp.rc, 0.3 * sp.rc);
+    nbl_build_pthread(&nl_pt, &cl_nbl_pt, p_nbl_pthread, sp.L, sp.rc, (size_t)N);
 
-    NeighborList nl_pthread;
-    nbl_init(&nl_pthread, (size_t)N, sp.rc, 0.3 * sp.rc);
-    nbl_build_pthread(&nl_pthread, &cl3, p_nbl_pthread, sp.L, sp.rc, (size_t)N);
-
-    (void) md_compute_forces_nbl_pthread(p_nbl_pthread, &sp, &nl_pthread);
+    md_compute_forces_nbl_pthread(p_nbl_pthread, &sp, &nl_pt);
 
     for (int step = 0; step < AUTOTUNE_N_TIMESTEPS; step++) {
         double K, U;
-        U = md_integrate_nbl_pthread(p_nbl_pthread, &sp, &nl_pthread, &cl3, &K);
+        U = md_integrate_nbl_pthread(p_nbl_pthread, &sp, &nl_pt, &cl_nbl_pt, &K);
         fprintf(f_nbl_pthread, "%d,%.10f,%.10f,%.10f\n", step, K, U, K+U);
     }
 
@@ -420,19 +608,17 @@ int main(int argc, char **argv)
 
     fclose(f_nbl_pthread);
     io_write_pdb("output/nbl_pthread_positions.pdb", p_nbl_pthread, (size_t)N);
-    printf("NEIGHBOR-LIST MD (Pthread) done. Time: %.6f seconds\n", time_nbl_pthread);
-    printf("Memory usage for private arrays: %.2f MB\n",
-           nbl_pthread_memory_usage((size_t)N) / (1024.0 * 1024.0));
+    printf("NEIGHBOR-LIST (Pthread) done. Time: %.6f seconds\n", time_nbl_pthread);
 
     // ------------------------------------------------
-    // 7.5 MANHATTAN CELL-LIST MD (Pthread) - WITH TIMING
+    // 7.5 MANHATTAN CELL-LIST MD (Pthread)
     // ------------------------------------------------
     printf("\n================ MANHATTAN CELL-LIST MD (Pthread) ================\n");
     printf("Manhattan threads: %d\n", sp.nthreads);
 
     FILE *f_manh = open_energy_csv("output/manhattan_pthread_energies.csv");
     if (!f_manh) {
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
@@ -460,6 +646,36 @@ int main(int argc, char **argv)
     printf("MANHATTAN CELL-LIST (Pthread) done. Time: %.6f seconds\n", time_manh);
 
     // ------------------------------------------------
+    // 7.6 MANHATTAN CELL-LIST MD (GPU)
+    // ------------------------------------------------
+    printf("\n================ MANHATTAN CELL-LIST MD (GPU) ================\n");
+
+    FILE *f_manh_gpu = open_energy_csv("output/manhattan_gpu_energies.csv");
+    if (!f_manh_gpu) {
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
+        free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
+        return 1;
+    }
+
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_start);
+
+    // initial forces on GPU
+    md_compute_forces_cell_manhattan_gpu(p_manhattan, &sp);
+
+    for (int step = 0; step < AUTOTUNE_N_TIMESTEPS; step++) {
+        double K, U;
+        U = md_integrate_manhattan_gpu(p_manhattan, &sp, &K);
+        fprintf(f_manh_gpu, "%d,%.10f,%.10f,%.10f\n", step, K, U, K+U);
+    }
+
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_stop);
+    double time_manh_gpu = interval(time_start, time_stop);
+
+    fclose(f_manh_gpu);
+    io_write_pdb("output/manhattan_gpu_positions.pdb", p_manhattan, (size_t)N);
+    printf("MANHATTAN CELL-LIST (GPU) done. Time: %.6f seconds\n", time_manh_gpu);
+
+    // ------------------------------------------------
     // 8. COMPARE TIMES AND DETERMINE FASTEST
     // ------------------------------------------------
     printf("\n========================================\n");
@@ -473,6 +689,8 @@ int main(int argc, char **argv)
            nbl_pthread_get_num_threads(), time_nbl_pthread, time_full/time_nbl_pthread);
     printf("MANHATTAN (%d threads):     %.6f seconds (%.2fx speedup)\n",
            sp.nthreads, time_manh, time_full/time_manh);
+    printf("MANHATTAN (GPU):            %.6f seconds (%.2fx speedup)\n",
+           time_manh_gpu, time_full/time_manh_gpu);
     printf("========================================\n");
 
     // Determine fastest
@@ -506,11 +724,19 @@ int main(int argc, char **argv)
         fastest_name = "MANHATTAN CELL-LIST (Pthread)";
     }
 
+    if (time_manh_gpu < fastest_time) {
+        fastest_time = time_manh_gpu;
+        fastest_method = 6;
+        fastest_name = "MANHATTAN CELL-LIST (GPU)";
+    }
+
     printf("\nFASTEST METHOD: %s (%.6f seconds)\n", fastest_name, fastest_time);
 
     // ------------------------------------------------
     // 9. RUN FULL SIMULATION WITH FASTEST METHOD
     // ------------------------------------------------
+    const int USER_N_TIMESTEPS = 200;
+
     printf("\n========================================\n");
     printf("RUNNING FULL SIMULATION WITH: %s\nfor %d TIMESTEPS\n",
            fastest_name, USER_N_TIMESTEPS);
@@ -518,7 +744,7 @@ int main(int argc, char **argv)
 
     FILE *f_final = open_energy_csv("output/final_energies.csv");
     if (!f_final) {
-        free(p0); free(p_full); free(p_cell); free(p_nbl);
+        free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
         free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
         return 1;
     }
@@ -627,6 +853,16 @@ int main(int argc, char **argv)
         free(cl_final.counts);
         free(cl_final.cells);
     }
+    else if (fastest_method == 6) {
+        // GPU Manhattan: GPU builds Manhattan cell bins internally each step.
+        md_compute_forces_cell_manhattan_gpu(p_final, &sp);
+
+        for (int step = 0; step < USER_N_TIMESTEPS; step++) {
+            double K, U;
+            U = md_integrate_manhattan_gpu(p_final, &sp, &K);
+            fprintf(f_final, "%d,%.10f,%.10f,%.10f\n", step, K, U, K+U);
+        }
+    }
 
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_stop);
     double time_final = interval(time_start, time_stop);
@@ -644,22 +880,11 @@ int main(int argc, char **argv)
 
     free(cl.counts);   free(cl.cells);
     free(cl2.counts);  free(cl2.cells);
-    free(cl3.counts);  free(cl3.cells);
-    free(cl_half.counts); free(cl_half.cells);
-    free(cl_manh.counts); free(cl_manh.cells);
 
     free(nl.nb); free(nl.nb_index); free(nl.prev);
-    free(nl_pthread.nb); free(nl_pthread.nb_index); free(nl_pthread.prev);
 
-    free(p0);
-    free(p_full);
-    free(p_cell);
-    free(p_nbl);
-    free(p_cell_mt);
-    free(p_nbl_pthread);
-    free(p_manhattan);
-    free(p_final);
+    free(p0_dyn); free(p_full); free(p_cell); free(p_nbl);
+    free(p_cell_mt); free(p_nbl_pthread); free(p_manhattan); free(p_final);
 
-    printf("\nAll simulations complete.\n");
     return 0;
 }
