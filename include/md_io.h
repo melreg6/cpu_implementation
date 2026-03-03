@@ -3,9 +3,19 @@
 
 #include "md.h"
 
+
+#pragma once
+#ifdef __cplusplus
+extern "C" {
+#endif 
 //
 // Write particles to PDB file
 //
 void io_write_pdb(const char *path, Particle *p, size_t N);
 
+#endif
+
+
+#ifdef __cplusplus
+}
 #endif

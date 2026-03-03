@@ -3,6 +3,11 @@
 
 #include "md.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 //
 // Read ATOM lines from a PDB file.
 // Returns number of atoms read.
@@ -20,4 +25,9 @@ int binary_importer(const char *path,
                  double *xmin, double *xmax,
                  double *ymin, double *ymax,
                  double *zmin, double *zmax);
+#endif
+
+
+#ifdef __cplusplus
+}
 #endif

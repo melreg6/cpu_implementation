@@ -1,0 +1,37 @@
+CC      = gcc
+CFLAGS  = -O2 -std=c11 -Wall -Wextra -Iinclude
+
+NVCC    = nvcc
+NVFLAGS = -O3 -std=c++17 -Iinclude
+
+TARGET  = md_run_gpu
+
+SRC_C = \
+	src/main_gpu.c \
+	src/md_io.c \
+	src/pdb_importer.c \
+	src/cell_list.c
+
+SRC_CU = src/gpu_manhattan_cuda.cu
+
+OBJ_C  = $(SRC_C:.c=.o)
+OBJ_CU = $(SRC_CU:.cu=.o)
+
+all: output $(TARGET)
+
+output:
+	mkdir -p output
+
+src/%.o: src/%.c include/*.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+src/%.o: src/%.cu include/*.h
+	$(NVCC) $(NVFLAGS) -c $< -o $@
+
+$(TARGET): $(OBJ_C) $(OBJ_CU)
+	$(NVCC) -o $(TARGET) $(OBJ_C) $(OBJ_CU) -lm
+
+clean:
+	rm -f $(OBJ_C) $(OBJ_CU) $(TARGET)
+
+.PHONY: all clean output

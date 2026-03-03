@@ -56,7 +56,7 @@ void cell_list_build(CellList *cl, Particle *p, double L)
         cl->counts[c] = 0;
 
     // clear cell storage
-    size_t total_capacity = cl->N * 16;
+    size_t total_capacity = (size_t)cl->ncell * 16;
     for (size_t idx = 0; idx < total_capacity; idx++)
         cl->cells[idx] = -1;
 
